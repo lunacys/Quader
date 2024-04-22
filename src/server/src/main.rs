@@ -6,9 +6,8 @@ mod ws;
 use crate::config::Config;
 use crate::ws::server::{ChatServer, ChatServerHandle};
 use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use auth::mock::ensure_auth;
 use serde::Serialize;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use tokio::task::spawn_local;
 use tokio::{spawn, try_join};
 
@@ -20,6 +19,8 @@ pub struct Response {
 pub type ConnId = usize;
 pub type RoomId = String;
 pub type Msg = String;
+pub type LobbyUuid = String;
+pub type LobbyName = String;
 
 #[get("/health")]
 async fn healthcheck() -> impl Responder {
@@ -42,19 +43,22 @@ async fn chat_ws(
     chat_server: web::Data<ChatServerHandle>,
 ) -> Result<HttpResponse, actix_web::error::Error> {
     let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
+    let ui_res = ensure_auth(req);
+    if let None = ui_res {
+        return Err(actix_web::error::ErrorForbidden(
+            "invalid token".to_string(),
+        ));
+    }
+    let (user_info, _token) = ui_res.unwrap();
 
     spawn_local(ws::handler::chat_ws(
         (**chat_server).clone(),
         session,
         msg_stream,
+        user_info,
     ));
 
     Ok(res)
-}
-
-async fn get_count(count: web::Data<AtomicUsize>) -> impl Responder {
-    let current_count = count.load(Ordering::SeqCst);
-    format!("Visitors: {current_count}")
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -66,21 +70,15 @@ async fn main() -> std::io::Result<()> {
 
     log::info!("Using config {:?}", config);
 
-    //let mut lobby_container = LobbyContainer::new();
-    //seed_lobbies(&mut lobby_container);
-    //let lobbies = web::Data::new(lobby_container);
-
-    let app_state = Arc::new(AtomicUsize::new(0));
     let (chat_server, server_tx) = ChatServer::new();
     let chat_server = spawn(chat_server.run());
 
+    log::info!("constructing http server");
+
     let http_server = HttpServer::new(move || {
         App::new()
-            //.app_data(lobbies.clone())
             .app_data(web::Data::new(server_tx.clone()))
-            .app_data(web::Data::from(app_state.clone()))
             .service(healthcheck)
-            .route("/count", web::get().to(get_count))
             .service(web::resource("/ws").route(web::get().to(chat_ws)))
             .default_service(web::route().to(not_found))
             .wrap(actix_web::middleware::Logger::default())
@@ -89,7 +87,11 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", config.port))?
     .run();
 
+    log::info!("done constructing http server");
+
     try_join!(http_server, async move { chat_server.await.unwrap() })?;
+
+    log::info!("bye-bye");
 
     Ok(())
 }

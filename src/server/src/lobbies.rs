@@ -5,10 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::{pin, select};
 use uuid::Uuid;
+
+use crate::{
+    auth::UserInfo,
+    ws::wsboard::{WsBoardMgr, WsBoardMgrHandle},
+    ConnId, LobbyName, LobbyUuid,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LobbySettings {
@@ -22,6 +28,16 @@ impl LobbySettings {
     pub fn new(name: String, player_limit: usize) -> Self {
         Self { name, player_limit }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyListing {
+    pub uuid: String,
+    pub name: String,
+    pub creator_username: String,
+    pub player_limit: usize,
+    pub player_count: usize,
+    pub is_started: bool,
 }
 
 #[derive(Debug)]
@@ -54,15 +70,47 @@ impl LobbyContainer {
         self.lobby_map.remove(uuid)
     }
 
-    pub fn add_player(&mut self, uuid: &str, username: String) {
-        let lobby = self.lobby_map.get_mut(uuid).unwrap();
-        lobby.add_player(username);
+    /// Tries to add a new player to lobby with specified `uuid`.
+    /// If the lobby is full, returns `Err(())`.
+    /// Returns `Ok(())` otherwise.
+    pub fn try_add_player(
+        &mut self,
+        uuid: &str,
+        conn: ConnId,
+        user_info: UserInfo,
+    ) -> Result<(), ()> {
+        let lobby = self.lobby_map.get_mut(uuid);
+
+        match lobby {
+            Some(lobby) => lobby.try_add_player(conn, user_info),
+            None => Err(()),
+        }
     }
 
-    pub fn remove_player(&mut self, uuid: &str, username: &str) {
+    pub fn remove_player(&mut self, uuid: &str, username: &str) -> Result<(), ()> {
         let lobby = self.lobby_map.get_mut(uuid).unwrap();
-        lobby.remove_player(username);
+        lobby.try_remove_player(username)
     }
+
+    pub fn list_lobbies(&self) -> Vec<LobbyListing> {
+        self.lobby_map
+            .iter()
+            .map(|kv| LobbyListing {
+                uuid: kv.0.clone(),
+                name: kv.1.lobby_name.clone(),
+                player_limit: kv.1.player_limit,
+                player_count: kv.1.player_count(),
+                is_started: kv.1.is_started,
+                creator_username: kv.1.creator_username.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbyUser {
+    pub conn: ConnId,
+    pub user_info: UserInfo,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -77,14 +125,16 @@ pub enum LobbyNotification {
     Ended,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Lobby {
     pub uuid: String,
     pub lobby_name: String,
     pub player_limit: usize,
-    pub player_list: Vec<String>,
+    pub player_list: Vec<LobbyUser>,
     pub creator_username: String,
     pub is_started: bool,
+    board_mgr: WsBoardMgrHandle,
+    //board_mgr_task: JoinHandle<()>,
 }
 
 impl Lobby {
@@ -94,6 +144,9 @@ impl Lobby {
         lobby_name: String,
         player_limit: usize,
     ) -> Self {
+        let (board_mgr, handle) = WsBoardMgr::new();
+        //let board_mgr = tokio::spawn(board_mgr.run());
+
         Self {
             uuid,
             lobby_name,
@@ -101,8 +154,12 @@ impl Lobby {
             player_list: vec![],
             creator_username,
             is_started: false,
+            board_mgr: handle,
+            //board_mgr_task: board_mgr,
         }
     }
+
+    pub fn start(mut self) {}
 
     pub fn from_settings(lobby_settings: LobbySettings, creator_username: String) -> Self {
         Lobby::from_settings_with_id(lobby_settings, creator_username, Uuid::new_v4().to_string())
@@ -129,13 +186,47 @@ impl Lobby {
         self.player_list.len()
     }
 
-    pub fn add_player(&mut self, username: String) {
-        self.player_list.push(username);
+    /// Tries to add a new player. If the lobby is full, returns `Err(())`.
+    /// Returns `Ok(())` otherwise.
+    pub fn try_add_player(&mut self, conn: ConnId, user_info: UserInfo) -> Result<(), ()> {
+        if self.player_count() == self.player_limit {
+            return Err(());
+        }
+
+        self.player_list.push(LobbyUser { conn, user_info });
+        Ok(())
     }
 
-    pub fn remove_player(&mut self, username: &str) {
-        let index = self.player_list.iter().position(|x| x == username).unwrap();
-        self.player_list.remove(index);
+    pub fn try_remove_player(&mut self, username: &str) -> Result<(), ()> {
+        let index = self
+            .player_list
+            .iter()
+            .position(|x| x.user_info.username == username);
+        if let Some(index) = index {
+            self.player_list.remove(index);
+            return Ok(());
+        }
+
+        Err(())
+    }
+
+    pub fn remove_player(&mut self, conn: ConnId) -> bool {
+        let index = self.player_list.iter().position(|x| x.conn == conn);
+        match index {
+            Some(index) => {
+                self.player_list.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn contains_player_conn(&self, conn: ConnId) -> bool {
+        let index = self.player_list.iter().position(|x| x.conn == conn);
+        match index {
+            Some(_index) => true,
+            None => false,
+        }
     }
 }
 

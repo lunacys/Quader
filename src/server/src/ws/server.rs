@@ -4,17 +4,13 @@
  */
 
 use crate::{
-    lobbies::{Lobby, LobbyContainer, LobbySettings},
-    ConnId, Msg, RoomId,
+    auth::UserInfo,
+    lobbies::{Lobby, LobbyContainer, LobbyListing, LobbySettings},
+    ConnId, Msg,
 };
-use quader_engine::{
-    board::{self, Board},
-    time_mgr::TimeMgr,
-    wall_kick_data::WallKickData,
-};
-use rand::{thread_rng, Rng as _, RngCore};
+use rand::{thread_rng, Rng as _};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -24,22 +20,31 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use crate::lobbies::LobbyNotification;
 
-use super::{handler::WsBoardCommand, wsboard::WsBoardMgr};
+use super::handler::WsBoardCommand;
 
+#[derive(Debug)]
+struct Session {
+    pub conn: ConnId,
+    pub user_info: UserInfo,
+    pub conn_tx: mpsc::UnboundedSender<Msg>,
+}
+
+#[derive(Debug)]
 enum Command {
     Connect {
         conn_tx: mpsc::UnboundedSender<Msg>,
+        user_info: UserInfo,
         res_tx: oneshot::Sender<ConnId>,
     },
     Disconnect {
         conn: ConnId,
     },
-    List {
-        res_tx: oneshot::Sender<Vec<RoomId>>,
+    ListLobbies {
+        res_tx: oneshot::Sender<Vec<LobbyListing>>,
     },
-    Join {
+    JoinLobby {
         conn: ConnId,
-        room: RoomId,
+        lobby_id: String,
         res_tx: oneshot::Sender<()>,
     },
     Message {
@@ -85,10 +90,8 @@ enum Command {
 ///  │Board_1│ │Board_2│ │Board_N│
 ///  └───────┘ └───────┘ └───────┘
 /// ```
-#[derive(Debug)]
 pub struct ChatServer {
-    sessions: HashMap<ConnId, mpsc::UnboundedSender<Msg>>,
-    rooms: HashMap<RoomId, HashSet<ConnId>>,
+    sessions: HashMap<ConnId, Session>,
     lobby_container: LobbyContainer,
     visitor_count: Arc<AtomicUsize>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
@@ -96,35 +99,38 @@ pub struct ChatServer {
 
 impl ChatServer {
     pub fn new() -> (Self, ChatServerHandle) {
-        let mut rooms = HashMap::with_capacity(4);
-
-        rooms.insert("main".to_owned(), HashSet::new());
-
         let mut lobby_container = LobbyContainer::new();
         seed_lobbies(&mut lobby_container);
 
+        log::debug!("created lobbies");
+
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        (
+        log::debug!("setting up channels");
+
+        let res = (
             Self {
                 sessions: HashMap::new(),
-                rooms,
                 lobby_container,
                 visitor_count: Arc::new(AtomicUsize::new(0)),
                 cmd_rx,
             },
             ChatServerHandle { cmd_tx },
-        )
+        );
+
+        log::debug!("res");
+
+        res
     }
 
-    async fn send_system_message(&self, room: &str, skip: ConnId, msg: impl Into<String>) {
-        if let Some(sessions) = self.rooms.get(room) {
+    async fn send_system_message(&self, lobby_id: &str, skip: ConnId, msg: impl Into<String>) {
+        if let Some(lobby) = self.lobby_container.lobby_map.get(lobby_id) {
             let msg = msg.into();
 
-            for conn_id in sessions {
-                if *conn_id != skip {
-                    if let Some(tx) = self.sessions.get(conn_id) {
-                        let _ = tx.send(msg.clone());
+            for user in lobby.player_list.iter() {
+                if user.conn != skip {
+                    if let Some(tx) = self.sessions.get(&user.conn) {
+                        let _ = tx.conn_tx.send(format!("{}", msg.clone()));
                     }
                 }
             }
@@ -132,73 +138,59 @@ impl ChatServer {
     }
 
     async fn send_message(&self, conn: ConnId, msg: impl Into<String>) {
-        if let Some(room) = self
-            .rooms
+        if let Some(lobby) = self
+            .lobby_container
+            .lobby_map
             .iter()
-            .find_map(|(room, participants)| participants.contains(&conn).then_some(room))
+            .find_map(|(lobby_id, lobby)| lobby.contains_player_conn(conn).then_some(lobby_id))
         {
-            self.send_system_message(room, conn, msg).await;
+            self.send_system_message(&lobby, conn, msg).await;
         };
     }
 
-    async fn connect(&mut self, tx: mpsc::UnboundedSender<Msg>) -> ConnId {
-        log::info!("Someone joined");
-
-        self.send_system_message("main", 0, "Someone joined").await;
+    async fn connect(&mut self, tx: mpsc::UnboundedSender<Msg>, user_info: UserInfo) -> ConnId {
+        log::info!("{} joined", &user_info.username);
 
         let id = thread_rng().gen::<usize>();
-        self.sessions.insert(id, tx);
+        let session = Session {
+            conn: id,
+            user_info,
+            conn_tx: tx,
+        };
+        self.sessions.insert(id, session);
 
-        self.rooms.entry("main".to_owned()).or_default().insert(id);
-
-        let count = self.visitor_count.fetch_add(1, Ordering::SeqCst);
-        self.send_system_message("main", 0, format!("Total visitors {count}"))
-            .await;
+        let _count = self.visitor_count.fetch_add(1, Ordering::SeqCst);
+        /* self.send_system_message("main", 0, format!("Total visitors {count}"))
+        .await; */
 
         id
     }
 
     async fn disconnect(&mut self, conn_id: ConnId) {
-        log::info!("Someone disconnected");
+        log::info!("disconnect");
 
-        let mut rooms: Vec<String> = vec![];
+        let session = self.sessions.get(&conn_id);
+        let mut lobby_ids: Vec<String> = vec![];
 
-        if self.sessions.remove(&conn_id).is_some() {
-            for (name, sessions) in &mut self.rooms {
-                if sessions.remove(&conn_id) {
-                    rooms.push(name.to_owned());
+        let username = match session {
+            Some(s) => &s.user_info.username,
+            None => "Someone",
+        };
+
+        log::info!("{} disconnected", username);
+
+        if session.is_some() {
+            for (lobby_id, lobby) in &mut self.lobby_container.lobby_map {
+                if lobby.remove_player(conn_id) {
+                    lobby_ids.push(lobby_id.to_owned());
                 }
             }
         }
 
-        for room in rooms {
-            self.send_system_message(&room, 0, "Someone disconnected")
+        for lobby_id in lobby_ids {
+            self.send_system_message(&lobby_id, 0, format!("{} disconnected", username))
                 .await;
         }
-    }
-
-    fn list_rooms(&mut self) -> Vec<String> {
-        self.rooms.keys().cloned().collect()
-    }
-
-    async fn join_room(&mut self, conn_id: ConnId, room: String) {
-        let mut rooms = Vec::new();
-
-        for (n, sessions) in &mut self.rooms {
-            if sessions.remove(&conn_id) {
-                rooms.push(n.to_owned());
-            }
-        }
-
-        for room in rooms {
-            self.send_system_message(&room, 0, "Someone disconnected")
-                .await;
-        }
-
-        self.rooms.entry(room.clone()).or_default().insert(conn_id);
-
-        self.send_system_message(&room, conn_id, "Someone connected")
-            .await;
     }
 
     async fn exec_board_cmd(&mut self, conn: ConnId, cmd: WsBoardCommand) -> String {
@@ -242,6 +234,34 @@ impl ChatServer {
         "ok".to_string()
     }
 
+    fn list_lobbies(&self) -> Vec<LobbyListing> {
+        self.lobby_container.list_lobbies()
+    }
+
+    async fn join_lobby(&mut self, conn: ConnId, lobby_id: String) {
+        if let Some(session) = self.sessions.get(&conn) {
+            let res =
+                self.lobby_container
+                    .try_add_player(&lobby_id, conn, session.user_info.clone());
+            if res.is_ok() {
+                self.send_system_message(
+                    &lobby_id,
+                    0,
+                    format!("{} connected!", session.user_info.username),
+                )
+                .await;
+                log::info!(
+                    "player {} joined lobby {}",
+                    session.user_info.username,
+                    lobby_id
+                )
+            } else {
+                log::error!("error joining lobby {}", lobby_id);
+                //self.send_message(conn, format!("error")).await;
+            }
+        }
+    }
+
     async fn start_match(&self, conn: ConnId) {
         // TODO: find lobby by ConnId
         let lobby = self.lobby_container.lobby_map.get("0").unwrap();
@@ -261,21 +281,23 @@ impl ChatServer {
     }
 
     pub async fn run(mut self) -> io::Result<()> {
+        log::debug!("running server");
+
         while let Some(cmd) = self.cmd_rx.recv().await {
+            log::debug!("got cmd: {:?}", &cmd);
+
             match cmd {
-                Command::Connect { conn_tx, res_tx } => {
-                    let conn_id = self.connect(conn_tx).await;
+                Command::Connect {
+                    conn_tx,
+                    user_info,
+                    res_tx,
+                } => {
+                    log::debug!("connecting user");
+                    let conn_id = self.connect(conn_tx, user_info).await;
                     let _ = res_tx.send(conn_id);
                 }
                 Command::Disconnect { conn } => {
                     self.disconnect(conn).await;
-                }
-                Command::List { res_tx } => {
-                    let _ = res_tx.send(self.list_rooms());
-                }
-                Command::Join { conn, room, res_tx } => {
-                    self.join_room(conn, room).await;
-                    let _ = res_tx.send(());
                 }
                 Command::Message { conn, msg, res_tx } => {
                     self.send_message(conn, msg).await;
@@ -285,10 +307,9 @@ impl ChatServer {
                     let res = self.exec_board_cmd(conn, cmd).await;
                     let _ = res_tx.send(res);
                 }
-                Command::StartMatch { conn, res_tx } => {
-                    self.start_match(conn).await;
-                    let _ = res_tx.send(());
-                }
+                Command::StartMatch { conn, res_tx } => {}
+                Command::ListLobbies { .. } => {}
+                Command::JoinLobby { .. } => {}
             }
         }
 
@@ -302,35 +323,23 @@ pub struct ChatServerHandle {
 }
 
 impl ChatServerHandle {
-    pub async fn connect(&self, conn_tx: mpsc::UnboundedSender<String>) -> ConnId {
+    pub async fn connect(
+        &self,
+        conn_tx: mpsc::UnboundedSender<String>,
+        user_info: UserInfo,
+    ) -> ConnId {
         let (res_tx, res_rx) = oneshot::channel();
 
+        log::debug!("sending Command::Connect");
         self.cmd_tx
-            .send(Command::Connect { conn_tx, res_tx })
-            .unwrap();
-
-        res_rx.await.unwrap()
-    }
-
-    pub async fn list_rooms(&self) -> Vec<String> {
-        let (res_tx, res_rx) = oneshot::channel();
-
-        self.cmd_tx.send(Command::List { res_tx }).unwrap();
-
-        res_rx.await.unwrap()
-    }
-
-    pub async fn join_room(&self, conn: ConnId, room: impl Into<String>) {
-        let (res_tx, res_rx) = oneshot::channel();
-
-        self.cmd_tx
-            .send(Command::Join {
-                conn,
-                room: room.into(),
+            .send(Command::Connect {
+                conn_tx,
+                user_info,
                 res_tx,
             })
             .unwrap();
 
+        log::debug!("awaiting result");
         res_rx.await.unwrap()
     }
 
@@ -372,6 +381,28 @@ impl ChatServerHandle {
             .unwrap();
 
         res_rx.await.unwrap();
+    }
+
+    pub async fn list_lobbies(&self) -> Vec<LobbyListing> {
+        let (res_tx, res_rx) = oneshot::channel();
+
+        self.cmd_tx.send(Command::ListLobbies { res_tx }).unwrap();
+
+        res_rx.await.unwrap()
+    }
+
+    pub async fn join_lobby(&self, conn: ConnId, lobby_id: impl Into<String>) {
+        let (res_tx, res_rx) = oneshot::channel();
+
+        self.cmd_tx
+            .send(Command::JoinLobby {
+                conn,
+                lobby_id: lobby_id.into(),
+                res_tx,
+            })
+            .unwrap();
+
+        res_rx.await.unwrap()
     }
 }
 
