@@ -3,25 +3,25 @@
  * See the LICENSE file in the repository root for full licence text.
  */
 
-use std::collections::VecDeque;
+use crate::cell_holder::CellHolder;
+use crate::game_settings::AttackSettings;
+use crate::time_mgr::TimeMgr;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
-use crate::cell_holder::CellHolder;
-use crate::game_settings::AttackSettings;
-use crate::time_mgr::{TimeMgr};
+use std::collections::VecDeque;
 
 #[derive(Default, Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct IncomingDamage {
     pub amount: i32,
     pub delay: u32,
-    pub hole_x: u32
+    pub hole_x: u32,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct GarbageHardDropResult {
     pub in_damage_queue: Vec<IncomingDamage>,
-    pub out_damage: i32
+    pub out_damage: i32,
 }
 
 impl IncomingDamage {
@@ -29,7 +29,7 @@ impl IncomingDamage {
         Self {
             amount,
             delay: delay_ms,
-            hole_x: 0
+            hole_x: 0,
         }
     }
 }
@@ -40,7 +40,7 @@ pub struct GarbageMgr {
     // used for generating garbage holes,
     rng: ChaCha8Rng,
     last_garbage_x: Option<u32>,
-    attack_settings: AttackSettings
+    attack_settings: AttackSettings,
 }
 
 impl GarbageMgr {
@@ -49,7 +49,7 @@ impl GarbageMgr {
             queue: VecDeque::default(),
             rng: SeedableRng::from_entropy(),
             last_garbage_x: None,
-            attack_settings: *attack_settings
+            attack_settings: *attack_settings,
         }
     }
 
@@ -59,7 +59,7 @@ impl GarbageMgr {
             self.queue.push_back(IncomingDamage {
                 amount: damage,
                 delay: self.attack_settings.garbage_delay_ms,
-                hole_x
+                hole_x,
             });
         }
     }
@@ -68,12 +68,7 @@ impl GarbageMgr {
     /// The higher the messiness, the more random the holes are.
     /// Messiness = 0 means that the hole will be at the same x coordinate within
     /// pending garbage rows.
-    pub fn push_garbage(
-        &mut self,
-        amount: u32,
-        _messiness: u32,
-        cell_holder: &mut CellHolder
-    ) {
+    pub fn push_garbage(&mut self, amount: u32, _messiness: u32, cell_holder: &mut CellHolder) {
         let width = cell_holder.width as u32;
 
         let garbage_hole_x: u32 = if let Some(gx) = self.last_garbage_x {
@@ -94,12 +89,10 @@ impl GarbageMgr {
         }
     }
 
-
     pub fn hard_drop(&mut self, lines_cleared: u32, outgoing_damage: i32) -> GarbageHardDropResult {
-
         let mut result = GarbageHardDropResult {
             in_damage_queue: vec![],
-            out_damage: outgoing_damage
+            out_damage: outgoing_damage,
         };
 
         // if the queue is empty then deal damage to the enemies
@@ -123,11 +116,11 @@ impl GarbageMgr {
             }
         }
 
-        // if player hasn't cleared any lines, than push garbage onto his board
+        // if player hasn't cleared any lines, then push garbage onto his board
         if lines_cleared == 0 {
             return GarbageHardDropResult {
                 in_damage_queue: incoming_dmg.into_iter().collect(),
-                out_damage: 0
+                out_damage: 0,
             };
         }
 
@@ -160,7 +153,7 @@ impl GarbageMgr {
                 self.queue.push_front(IncomingDamage {
                     amount: -result.out_damage,
                     delay: dmg.delay,
-                    hole_x: dmg.hole_x
+                    hole_x: dmg.hole_x,
                 });
                 result.out_damage = 0;
                 break;
@@ -188,9 +181,18 @@ mod tests {
 
     const ATTACK_SETTINGS: AttackSettings = AttackSettings {
         garbage_delay_ms: 500,
-        lines_0: 0, lines_1: 0, lines_2: 1, lines_3: 2, lines_4: 5,
-        t_spin_single_mini: 0, t_spin_single: 2, t_spin_double: 4, t_spin_triple: 6,
-        all_clear: 8, combos: [1,2,3,4,5], b2bs: [1,2,3,4,5]
+        lines_0: 0,
+        lines_1: 0,
+        lines_2: 1,
+        lines_3: 2,
+        lines_4: 5,
+        t_spin_single_mini: 0,
+        t_spin_single: 2,
+        t_spin_double: 4,
+        t_spin_triple: 6,
+        all_clear: 8,
+        combos: [1, 2, 3, 4, 5],
+        b2bs: [1, 2, 3, 4, 5],
     };
 
     fn create_garbage_mgr() -> GarbageMgr {
@@ -199,7 +201,9 @@ mod tests {
 
     fn id(amount: i32, delay: u32) -> IncomingDamage {
         IncomingDamage {
-            amount, delay, hole_x: 0
+            amount,
+            delay,
+            hole_x: 0,
         }
     }
 
