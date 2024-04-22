@@ -3,25 +3,23 @@
  * See the LICENSE file in the repository root for full licence text.
  */
 
-use macroquad::prelude::*;
 use crate::board_manager::BoardManager;
+use macroquad::prelude::*;
 
 pub struct GameRoot {
     close_requested: bool,
-    board_manager: Box<BoardManager>
+    board_manager: Box<BoardManager>,
 }
 
 impl GameRoot {
     pub fn new() -> Self {
-
         GameRoot {
             close_requested: false,
-            board_manager: Box::new(BoardManager::new())
+            board_manager: Box::new(BoardManager::new()),
         }
     }
 
     pub async fn run(&mut self) {
-
         self.load_content().await;
 
         'main_loop: loop {
@@ -34,11 +32,11 @@ impl GameRoot {
             }
 
             self.update(get_frame_time());
-    
+
             clear_background(BLACK);
             self.render();
             self.render_ui();
-    
+
             macroquad_profiler::profiler(Default::default());
 
             next_frame().await
@@ -52,7 +50,7 @@ impl GameRoot {
     pub fn close(&mut self) {
         self.close_requested = true;
     }
-    
+
     fn update(&mut self, dt: f32) {
         self.board_manager.update(dt);
     }

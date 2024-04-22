@@ -3,19 +3,20 @@
  * See the LICENSE file in the repository root for full licence text.
  */
 
+use macroquad::miniquad::log;
 use macroquad::prelude::*;
 
 use crate::game_root::GameRoot;
 
-mod game_root;
-mod board_controller;
-mod board_renderer;
-mod board_controller_bot;
-mod board_manager;
-mod board_controller_remote;
 mod assets;
-mod scene;
+mod board_controller;
+mod board_controller_bot;
+mod board_controller_remote;
+mod board_manager;
+mod board_renderer;
 mod entity;
+mod game_root;
+mod scene;
 mod state_machine;
 
 fn window_conf() -> Conf {
