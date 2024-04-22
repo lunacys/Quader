@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tokio::sync::{mpsc, oneshot};
+use tokio::{pin, select};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +24,7 @@ impl LobbySettings {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LobbyContainer {
     pub lobby_map: HashMap<String, Lobby>,
 }
@@ -44,6 +46,10 @@ impl LobbyContainer {
         self.lobby_map.insert(uuid, lobby)
     }
 
+    pub fn get_lobby(&self, uuid: &str) -> Option<&Lobby> {
+        self.lobby_map.get(uuid)
+    }
+
     pub fn delete_lobby(&mut self, uuid: &str) -> Option<Lobby> {
         self.lobby_map.remove(uuid)
     }
@@ -59,7 +65,19 @@ impl LobbyContainer {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone)]
+pub enum LobbyCommand {
+    Start,
+    End,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum LobbyNotification {
+    Started,
+    Ended,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Lobby {
     pub uuid: String,
     pub lobby_name: String,
@@ -103,6 +121,10 @@ impl Lobby {
         )
     }
 
+    pub fn run(&self) -> RunningLobby {
+        RunningLobby::new(self)
+    }
+
     pub fn player_count(&self) -> usize {
         self.player_list.len()
     }
@@ -115,4 +137,63 @@ impl Lobby {
         let index = self.player_list.iter().position(|x| x == username).unwrap();
         self.player_list.remove(index);
     }
+}
+
+pub struct RunningLobby {
+    pub recv: mpsc::UnboundedReceiver<LobbyNotification>,
+    pub send: mpsc::UnboundedSender<LobbyCommand>,
+}
+
+impl RunningLobby {
+    pub fn new(lobby: &Lobby) -> Self {
+        let (lobby_send, recv) = mpsc::unbounded_channel();
+        let (send, lobby_recv) = mpsc::unbounded_channel();
+
+        tokio::task::spawn(run_lobby(
+            lobby.lobby_name.to_string(),
+            lobby_send,
+            lobby_recv,
+        ));
+
+        Self { recv, send }
+    }
+
+    pub async fn start(&self) {
+        self.send.send(LobbyCommand::Start).ok();
+    }
+
+    pub async fn stop(&self) {
+        self.send.send(LobbyCommand::End).ok();
+    }
+
+    pub async fn try_recv(&mut self) -> Result<LobbyNotification, mpsc::error::TryRecvError> {
+        self.recv.try_recv()
+    }
+}
+
+async fn run_lobby(
+    lobby_name: String,
+    lobby_send: mpsc::UnboundedSender<LobbyNotification>,
+    mut lobby_recv: mpsc::UnboundedReceiver<LobbyCommand>,
+) {
+    loop {
+        match lobby_recv.recv().await {
+            Some(msg) => match msg {
+                LobbyCommand::Start => {
+                    log::info!("Starting lobby {}", lobby_name);
+                    lobby_send.send(LobbyNotification::Started).ok();
+                }
+                LobbyCommand::End => {
+                    log::info!("Stopping lobby {}", lobby_name);
+                    lobby_send.send(LobbyNotification::Ended).ok();
+                    break;
+                }
+            },
+            None => {
+                break;
+            }
+        }
+    }
+
+    log::info!("Done with lobby {}", lobby_name);
 }

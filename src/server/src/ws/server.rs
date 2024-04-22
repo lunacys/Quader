@@ -22,6 +22,7 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, oneshot};
+use crate::lobbies::LobbyNotification;
 
 use super::{handler::WsBoardCommand, wsboard::WsBoardMgr};
 
@@ -241,6 +242,24 @@ impl ChatServer {
         "ok".to_string()
     }
 
+    async fn start_match(&self, conn: ConnId) {
+        // TODO: find lobby by ConnId
+        let lobby = self.lobby_container.lobby_map.get("0").unwrap();
+        let mut running_lobby = lobby.run();
+        running_lobby.start().await;
+        if let Ok(msg) = running_lobby.try_recv().await {
+            match msg {
+                LobbyNotification::Started => {
+                    log::info!("Lobby started!");
+                }
+                LobbyNotification::Ended => {
+                    log::info!("Lobby ended!");
+                }
+            }
+        }
+        running_lobby.stop().await;
+    }
+
     pub async fn run(mut self) -> io::Result<()> {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
@@ -266,7 +285,10 @@ impl ChatServer {
                     let res = self.exec_board_cmd(conn, cmd).await;
                     let _ = res_tx.send(res);
                 }
-                Command::StartMatch { conn, res_tx } => {}
+                Command::StartMatch { conn, res_tx } => {
+                    self.start_match(conn).await;
+                    let _ = res_tx.send(());
+                }
             }
         }
 
